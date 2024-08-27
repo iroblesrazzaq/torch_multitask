@@ -5,6 +5,20 @@ import torch.optim as optim
 import os
 import tools
 
+
+def torch_popvec(y):
+    """Population vector read-out in PyTorch."""
+    num_units = y.size(-1)
+    pref = torch.arange(0, 2*np.pi, 2*np.pi/num_units, dtype=y.dtype, device=y.device)
+    cos_pref = torch.cos(pref)
+    sin_pref = torch.sin(pref)
+    temp_sum = torch.sum(y, dim=-1)
+    temp_cos = torch.sum(y * cos_pref, dim=-1) / temp_sum
+    temp_sin = torch.sum(y * sin_pref, dim=-1) / temp_sum
+    loc = torch.atan2(temp_sin, temp_cos)
+    return torch.fmod(loc, 2*np.pi)
+
+
 class LeakyRNNCell(nn.Module):
     def __init__(self, input_size, hidden_size, alpha, sigma_rec=0, activation='softplus', w_rec_init='diag', rng=None):
         super(LeakyRNNCell, self).__init__()
@@ -68,18 +82,28 @@ class LeakyRNNCell(nn.Module):
         """Most basic RNN: output = new_state = act(W * input + U * state + B)."""
         if state is None:
             state = torch.zeros(inputs.shape[0], self.hidden_size, device=inputs.device)
+            #print(f"Initialized state with state.shape: {state.shape}")
         else:
+            #print(f"Stack: RNN forward \nstate.shape: {state.shape}")
+
             state = state.squeeze(0)
+
+        #print(f"pre batch inputs.shape: {inputs.shape}\nstate.shape: {state.shape}")
 
         inputs = inputs.squeeze(0)
 
         if inputs.ndim == 2:
             # Transpose the weight matrix during the computation
-            mult_out = torch.matmul(torch.cat((inputs, state), dim=1), self.weight.T)
-        else:
+            #print("Stack: RNN forward, Using batch processing")
+            #print(f"Stack: RNN forward, pre batch inputs.shape: {inputs.shape}\nstate.shape: {state.shape}")
+            mult_out = torch.matmul(torch.cat((inputs, state), dim=1), self.weight)
+            #print("Stack: RNN forward, completed mult")
+        else:    
+            #print("Stack: RNN forward, Using single processing")
+            #print(f"Stack: RNN forward, inputs.shape: {inputs.shape}\nstate.shape: {state.shape}")
             # Transpose the weight matrix during the computation
             mult_out = torch.matmul(torch.cat((inputs, state), dim=0), self.weight.T)
-
+            #print("Stack: RNN forward, completed mult")
         gate_inputs = mult_out + self.bias
 
         noise = torch.randn_like(state) * self.sigma
@@ -135,6 +159,9 @@ class Model(nn.Module):
         
     def forward(self, x, y=None, c_mask=None):
         hp = self.hp
+        n_batch, n_time, _ = x.shape
+        n_rnn = hp['n_rnn']
+        n_output = hp['n_output']
         
         if hp['use_separate_input']:
             sensory_inputs, rule_inputs = torch.split(x, [hp['rule_start'], hp['n_rule']], dim=-1)
@@ -146,23 +173,34 @@ class Model(nn.Module):
         else:
             rnn_inputs = x
         
-        h = torch.zeros(rnn_inputs.shape[0], rnn_inputs.shape[1], hp['n_rnn']).to(x.device)
+        h = torch.zeros(n_time + 1, n_batch, n_rnn).to(x.device)
         
-        for t in range(rnn_inputs.shape[0]):
-            h[t], _ = self.rnn(rnn_inputs[t], h[t-1] if t > 0 else None)
+        for t in range(n_time):
+            h[t+1], _ = self.rnn(rnn_inputs[:, t, :], h[t])
         
-        y_hat = self.output(h)
+        h_shaped = h[1:].reshape(-1, n_rnn)
+        y_hat_ = self.output(h_shaped)
         
         if hp['loss_type'] == 'lsq':
-            y_hat = torch.sigmoid(y_hat)
+            # Least-square loss
+            y_hat = torch.sigmoid(y_hat_)
             if y is not None and c_mask is not None:
-                self.cost_lsq = torch.mean(torch.pow((y - y_hat) * c_mask, 2))
+                y_shaped = y.reshape(-1, n_output)
+                self.cost_lsq = torch.mean(
+                    torch.pow((y_shaped - y_hat) * c_mask, 2))
         else:
-            y_hat = torch.softmax(y_hat, dim=-1)
+            y_hat = torch.softmax(y_hat_, dim=-1)
             if y is not None and c_mask is not None:
-                self.cost_lsq = torch.mean(-c_mask * torch.sum(y * torch.log(y_hat), dim=-1))
+                y_shaped = y.reshape(-1, n_output)
+                self.cost_lsq = torch.mean(
+                    -c_mask * torch.sum(y_shaped * torch.log(y_hat), dim=-1))
         
-        return y_hat, h
+        self.y_hat = y_hat.view(n_time, n_batch, n_output)
+        
+        y_hat_fix, y_hat_ring = torch.split(self.y_hat, [1, n_output - 1], dim=-1)
+        self.y_hat_loc = torch_popvec(y_hat_ring)
+        
+        return self.y_hat, self.cost_lsq
     
     def set_optimizer(self, extra_cost=None):
         hp = self.hp
